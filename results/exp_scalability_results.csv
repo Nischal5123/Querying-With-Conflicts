@@ -1,0 +1,4 @@
+attrs,num_attrs,domain_size,alg1_time_s,alg1_timeout,alg1_cred_edges,alg2_time_s,alg4_time_s,alg24_time_s,alg24_timeout,q_base_groups,q_star_groups,data_source
+sex,1,2,1.4041994290892035e-05,False,0,2.8750000637955964e-05,1.2584001524373889e-05,4.133400216232985e-05,False,1.0,1.0,real_census
+education_num+sex,2,32,0.0003888749997713603,False,413,0.0004214590007904917,0.0069025830016471446,0.007324042002437636,False,32.0,5.0,real_census
+education_num+sex+age,3,2368,1.7575474159966689,False,2382552,,,,True,,,real_census
