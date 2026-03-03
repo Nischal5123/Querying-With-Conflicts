@@ -4,27 +4,16 @@ COI (distinct-domain) + Scalability experiment over #attributes.
 
 What you get:
 - Core algorithms:
-    * Alg.1  : Credibility detection (fast path for uniform+threshold)
+    * Alg.1  : Credibility detection (fast path for uniform+threshold, fallback for quadratic)
     * Alg.2  : Build q_base by merging unsupported boundaries
     * Alg.4  : Maximally-informative DP over q_base
 - Utilities:
-    * evaluate_plan_utility(...) for q_babble/q_base/q_star
+    * evaluate_plan_utility(...) for q_babble/q_base/q_star (supports quadratic)
 - Tuple-safe bias:
     * make_random_multilevel_bias(...) works for tuple domains (Cartesian product)
 - Experiment:
     * run_scalability_time_vs_num_attrs_logging(...)
-      - For k = 1..K: pick k columns (smallest domains first)
-      - Build Cartesian domain of distinct values across those columns
-      - Bias: random multilevel over the tuple domain
-      - Measure:
-          time_alg1_first_s, |C| from first pass,
-          time_alg2_s, time_alg4_s, time_alg24_s (=2+4),
-          utilities for q_babble/q_base/q_star, kept counts,
-          q_base_groups, q_star_groups, merges_alg2
-      - Append a row to CSV after each k
-      - Plot (#attrs vs combined (2+4) time)
-
-Default receiver: THRESHOLD, prior: UNIFORM by rank.
+      - Measures time and utility for THRESHOLD or QUADRATIC models.
 
 Author: you
 """
@@ -42,8 +31,9 @@ import matplotlib.pyplot as plt
 # ---------------------------------------------------------------------
 # Global tolerances
 # ---------------------------------------------------------------------
-EPS_COMPARE = 1e-5    # numeric comparison tolerance
-EPS_ORDER   = 1e-9    # tiny order-aware bonus weight (presentational/tie-break)
+EPS_COMPARE = 1e-5  # numeric comparison tolerance
+EPS_ORDER = 1e-9  # tiny order-aware bonus weight (presentational/tie-break)
+
 
 # =============================================================================
 # Priors (how rank maps to expected preference)
@@ -101,16 +91,8 @@ class PriorSpec:
 
 
 def compute_expected_posteriors(
-    q_groups: List[List[Any]], domain: List[Any], prior: PriorSpec
+        q_groups: List[List[Any]], domain: List[Any], prior: PriorSpec
 ) -> Dict[Any, float]:
-    """
-    Compute expected posteriors for each domain value GIVEN the group ranks in q_groups.
-    - q_groups is a list of groups (ties allowed).
-    - All items in a group share the same posterior: the average of the expectations
-      across the consecutive ranks the group occupies.
-    - domain (DESC) defines k and (indirectly) the rank spectrum.
-    Works with non-numeric domain values (e.g., tuples).
-    """
     k = len(domain)
     post: Dict[Any, float] = {}
     r = 1  # current group’s starting DESC rank
@@ -135,15 +117,13 @@ def compute_expected_posteriors(
         post.setdefault(v, 0.0)
     return post
 
+
 # =============================================================================
 # Bias models (per-value bias)
 # =============================================================================
 
 @dataclass
 class Bias1D:
-    """
-    Per-value biases. 'custom' lets you work on tuple domains.
-    """
     kind: str
     degree: float = 1.0
     base: float = 0.0
@@ -167,7 +147,6 @@ class Bias1D:
             b = float(self.custom(x, domain_info))
             return float(min(max(b, 0.0), 1.0))
 
-        # Numeric kinds try to normalize; if that fails, fall back to base.
         try:
             lo = float(domain_info.get("min", 0.0))
             hi = float(domain_info.get("max", 1.0))
@@ -208,765 +187,293 @@ class Bias1D:
             b = self.base
         return float(min(max(b, 0.0), 1.0))
 
-@dataclass
-class CompositeBias:
-    rules: List[Bias1D]
-    combine: str = "max"  # 'max' or 'sum'
-
-    def bias_for_value(self, x: Any, domain_info: Dict[str, float]) -> float:
-        vals = [r.bias_for_value(x, domain_info) for r in self.rules]
-        if not vals:
-            return 0.0
-        if self.combine == "sum":
-            return float(min(max(sum(vals), 0.0), 1.0))
-        return float(min(max(max(vals), 0.0), 1.0))
 
 def biases_from_bias_obj(domain: List[Any], bias_obj: Any) -> Dict[Any, float]:
-    if not domain:
-        return {}
-    info = {"min": min(domain), "max": max(domain)}  # OK for tuples (lex order)
+    if not domain: return {}
+    info = {"min": min(domain), "max": max(domain)}
     return {v: float(min(max(bias_obj.bias_for_value(v, info), 0.0), 1.0)) for v in domain}
 
-def make_random_multilevel_bias(
-    domain_values: List[Any],
-    levels: Tuple[float, ...] = (0.6, 0.5, 0.2, 0.2),
-    probs:  Tuple[float, ...] = (0.25, 0.25, 0.25, 0.25),
-    seed: Optional[int] = 123,
-) -> Bias1D:
-    """Tuple-safe random multilevel bias: assigns each distinct value a level."""
-    rng = np.random.default_rng(seed)
-    dom = list(dict.fromkeys(domain_values))  # stable dedupe
-    P = np.array(probs, dtype=float); P = P / P.sum()
-    labels = rng.choice(len(levels), size=len(dom), p=P)
-    value2bias = {dom[i]: float(levels[int(lbl)]) for i, lbl in enumerate(labels)}
-    def f(value: Any, _info: Dict[str, float]) -> float:
-        return value2bias.get(value, 0.0)
-    return Bias1D(kind="custom", custom=f)
 
-
-def make_random_L_level_bias(
-    domain_values,
-    L: int,
-    seed: int = 123,
-    levels: Optional[Tuple[float, ...]] = None,
-    probs: Optional[Tuple[float, ...]] = None,
-):
-    """Assigns each domain value to one of L levels (with possible collisions)."""
+def make_random_L_level_bias(domain_values, L, seed=123):
     rng = np.random.default_rng(seed)
     dom = list(dict.fromkeys(domain_values))
-
-    if levels is None:
-        # Evenly spaced in (0,1), avoid extremes for stability.
-        levels = tuple(np.linspace(0.05, 0.95, num=L))
-    if probs is None:
-        probs = tuple([1.0 / L] * L)
-
-    P = np.array(probs, dtype=float); P = P / P.sum()
-    labels = rng.choice(len(levels), size=len(dom), p=P)
+    levels = tuple(np.linspace(0.05, 0.95, num=L))
+    labels = rng.choice(len(levels), size=len(dom))
     value2bias = {dom[i]: float(levels[int(lbl)]) for i, lbl in enumerate(labels)}
-
-    def f(value, _info): return value2bias.get(value, 0.0)
-    return Bias1D(kind="custom", custom=f)
-
-
-def make_random_unique_bias(domain_values, seed: int = 123):
-    rng = np.random.default_rng(seed)
-    dom = list(dict.fromkeys(domain_values))  # stable dedupe
-    # Assign each value a unique bias in (0,1). Spread them evenly, then shuffle for reproducibility.
-    L = len(dom)
-    raw = np.linspace(0.05, 0.95, num=L)   # avoid exact 0/1 edges
-    rng.shuffle(raw)
-    value2bias = {dom[i]: float(raw[i]) for i in range(L)}
-    def f(value, _info): return value2bias.get(value, 0.0)
-    return Bias1D(kind="custom", custom=f)
+    return Bias1D(kind="custom", custom=lambda v, _: value2bias.get(v, 0.0))
 
 
 # =============================================================================
 # Receiver models & utilities
 # =============================================================================
 
-def system_best_response_threshold(
-    q_groups: List[List[Any]], domain: List[Any],
-    post: Dict[Any, float], biases: Dict[Any, float],
-) -> Dict[Any, int]:
-    """Threshold receiver: keep(v) = 1{post[v] > bias[v]}."""
-    return {v: 1 if (post.get(v, 0.0) - biases.get(v, 0.0)) > EPS_COMPARE else 0
-            for g in q_groups for v in g}
+def system_best_response_threshold(q_groups, domain, post, biases):
+    return {v: 1 if (post.get(v, 0.0) - biases.get(v, 0.0)) > EPS_COMPARE else 0 for v in domain}
 
-def system_best_response_quadratic(
-    q_groups: List[List[Any]], domain: List[Any],
-    post: Dict[Any, float], biases: Dict[Any, float],
-    gamma: float = 1.0,
-) -> Dict[Any, float]:
-    """Quadratic receiver: action(v) = clip(gamma * post[v] + bias[v], 0, 1)."""
-    out: Dict[Any, float] = {}
-    for g in q_groups:
-        for v in g:
-            a = gamma * post.get(v, 0.0) + biases.get(v, 0.0)
-            out[v] = 0.0 if a < 0.0 else (1.0 if a > 1.0 else a)
+
+def system_best_response_quadratic(q_groups, domain, post, biases, gamma=1.0):
+    out = {}
+    for v in domain:
+        a = gamma * post.get(v, 0.0) + biases.get(v, 0.0)
+        out[v] = 0.0 if a < 0.0 else (1.0 if a > 1.0 else a)
     return out
 
-def system_best_response(
-    q_groups: List[List[Any]], domain: List[Any], prior: PriorSpec,
-    biases: Dict[Any, float], receiver_model: str = "threshold", gamma: float = 1.0,
-):
+
+def system_best_response(q_groups, domain, prior, biases, receiver_model="threshold", gamma=1.0):
     post = compute_expected_posteriors(q_groups, domain, prior)
     if receiver_model == "threshold":
         return system_best_response_threshold(q_groups, domain, post, biases)
-    if receiver_model == "quadratic":
-        return system_best_response_quadratic(q_groups, domain, post, biases, gamma=gamma)
-    raise ValueError("receiver_model must be 'threshold' or 'quadratic'")
+    return system_best_response_quadratic(q_groups, domain, post, biases, gamma=gamma)
 
-def _exposure_weights(order_list: List[Any], scheme: str = "harmonic") -> Dict[Any, float]:
-    n = len(order_list)
-    if n == 0:
-        return {}
-    if scheme == "harmonic":
-        raw = [1.0 / (r + 1) for r in range(n)]
-    elif scheme == "geometric":
-        raw = [0.9 ** r for r in range(n)]
-    else:
-        raw = [1.0 / (r + 1) for r in range(n)]
-    Z = sum(raw) or 1.0
-    ws = [w / Z for w in raw]
-    return {order_list[r]: ws[r] for r in range(n)}
 
-def user_utility_from_response(
-    theta: Dict[Any, float], response, receiver_model: str,
-    *, order_list: Optional[List[Any]] = None, eps_order: float = 0.0, exposure_scheme: str = "harmonic",
-) -> float:
+def user_utility_from_response(theta, response, receiver_model, *, order_list=None, eps_order=0.0):
     if receiver_model == "threshold":
         base = sum(theta.get(v, 0.0) * a for v, a in response.items())
-        act = response  # 0/1
     else:
+        # Quadratic utility: - \sum (action - truth)^2
         base = -sum((response.get(v, 0.0) - theta.get(v, 0.0)) ** 2 for v in theta.keys())
-        act = response  # [0,1]
+
     if eps_order > 0.0 and order_list is not None:
-        w = _exposure_weights(order_list, scheme=exposure_scheme)
-        bonus = sum(w.get(v, 0.0) * theta.get(v, 0.0) * float(act.get(v, 0.0)) for v in order_list)
-        return base + eps_order * bonus
+        # Simple exposure weight tie-breaker
+        for r, v in enumerate(order_list):
+            base += eps_order * (1.0 / (r + 1)) * theta.get(v, 0.0) * float(response.get(v, 0.0))
     return base
 
-# =============================================================================
-# Small helpers
-# =============================================================================
-
-def flatten_in_order(q_groups: List[List[Any]]) -> List[Any]:
-    return [x for g in q_groups for x in g]
-
-def op_pairs_strict(q_groups: List[List[Any]]) -> List[Tuple[Any, Any]]:
-    pairs: List[Tuple[Any, Any]] = []
-    for i in range(len(q_groups)):
-        for j in range(i + 1, len(q_groups)):
-            for u in q_groups[i]:
-                for v in q_groups[j]:
-                    pairs.append((u, v))
-    return pairs
-
-def swap_single_pair(q_groups: List[List[Any]], u: Any, v: Any) -> List[List[Any]]:
-    return [[(v if x == u else (u if x == v else x)) for x in g] for g in q_groups]
-
-def dedupe_and_sort_desc(values: List[Any]) -> List[Any]:
-    return sorted(set(values), reverse=True)
-
-def _validate_partition_or_die(q_groups: List[List[Any]], domain: List[Any]) -> None:
-    flat = [x for g in q_groups for x in g]
-    if set(flat) != set(domain) or len(flat) != len(domain):
-        raise ValueError("q_groups must be a partition of `domain` (cover each value exactly once, no dups).")
 
 # =============================================================================
 # Alg. 1, 2, 4
 # =============================================================================
 
-def _is_fully_symmetric_bias(biases: Dict[Any, float]) -> bool:
-    if not biases:
-        return True
-    vals = list(biases.values())
-    return (max(vals) - min(vals)) <= EPS_COMPARE
-
 def algorithm_1_credibility_detection(
-    q_groups: List[List[Any]], domain: List[Any], prior: PriorSpec, *,
-    biases: Dict[Any, float],
-    receiver_model: str = "threshold",
-    gamma: float = 1.0,
-    eps_order: float = 0.0,
-    tie_policy: str = "auto",          # "auto" | "neutral" | "force_on_ties"
-    rule: str = "paper",               # "paper" | "strict_opposite"
+        q_groups, domain, prior, *, biases, receiver_model="threshold", gamma=1.0, eps_order=0.0, rule="paper"
 ) -> Set[Tuple[Any, Any]]:
-    """
-    Compute set C of credible strict edges present in q_groups.
-
-    Fast path (uniform prior + threshold + eps≈0):
-      swapping (u,v) only reassigns group-average posteriors; O(1) deltas.
-
-    rule:
-      - "paper": mark (u,v) unless BOTH types strictly prefer the same column
-      - "strict_opposite": require strict & opposite choices across types
-    """
-    if tie_policy == "auto" and _is_fully_symmetric_bias(biases):
-        return set(op_pairs_strict(q_groups))
-
-    fast = (prior.kind == "uniform" and receiver_model == "threshold" and abs(eps_order) <= 1e-12)
-    if fast:
-        items = [x for g in q_groups for x in g]
+    # Fast path for Uniform + Threshold
+    if prior.kind == "uniform" and receiver_model == "threshold" and abs(eps_order) <= 1e-12:
+        items = [x for g in q_groups for x in g];
         k = len(domain)
         idx = {v: i for i, v in enumerate(items)}
-
-        gid_of = [None] * len(items)
+        gid_of = [0] * len(items)
         for gi, g in enumerate(q_groups):
-            for v in g:
-                gid_of[idx[v]] = gi
-
+            for v in g: gid_of[idx[v]] = gi
         a_g = []
         r = 1
         for g in q_groups:
-            n = len(g)
-            j_hi = k - r + 1
-            j_lo = k - (r + n - 1) + 1
-            a_g.append(((j_hi + j_lo) / 2.0) / (k + 1.0))
+            n = len(g);
+            j_hi, j_lo = k - r + 1, k - (r + n - 1) + 1
+            a_g.append(((j_hi + j_lo) / 2.0) / (k + 1.0));
             r += n
+        theta_plus_vals = [a_g[gid_of[i]] for i in range(len(items))]
+        beta_q_vals = [1 if (theta_plus_vals[i] - biases[items[i]]) > EPS_COMPARE else 0 for i in range(len(items))]
+        U_pp = sum(theta_plus_vals[i] * beta_q_vals[i] for i in range(len(items)))
 
-        theta_plus = [a_g[gid_of[i]] for i in range(len(items))]
-        beta_q = [1 if (theta_plus[i] - biases[items[i]]) > EPS_COMPARE else 0
-                  for i in range(len(items))]
-        U_pp = sum(theta_plus[i] * beta_q[i] for i in range(len(items)))
-
-        C: Set[Tuple[Any, Any]] = set()
+        C = set()
         for gi in range(len(q_groups)):
             for gj in range(gi + 1, len(q_groups)):
                 ai, aj = a_g[gi], a_g[gj]
                 for u in q_groups[gi]:
-                    iu = idx[u]; bu = biases[u]
+                    iu = idx[u];
+                    bu = biases[u]
                     betas_u = 1 if (aj - bu) > EPS_COMPARE else 0
                     for v in q_groups[gj]:
-                        iv = idx[v]; bv = biases[v]
+                        iv = idx[v];
+                        bv = biases[v]
                         betas_v = 1 if (ai - bv) > EPS_COMPARE else 0
-
-                        up_q = U_pp
-                        up_s = U_pp \
-                             + theta_plus[iu] * (betas_u - beta_q[iu]) \
-                             + theta_plus[iv] * (betas_v - beta_q[iv])
-
-                        um_q = U_pp \
-                             + (aj - theta_plus[iu]) * beta_q[iu] \
-                             + (ai - theta_plus[iv]) * beta_q[iv]
-
-                        um_s = up_s \
-                             + (aj - theta_plus[iu]) * betas_u \
-                             + (ai - theta_plus[iv]) * betas_v
-
-                        if rule == "paper":
-                            both_q    = (up_q > up_s + EPS_COMPARE) and (um_q > um_s + EPS_COMPARE)
-                            both_swap = (up_s > up_q + EPS_COMPARE) and (um_s > um_q + EPS_COMPARE)
-                            if not (both_q or both_swap):
-                                C.add((u, v))
-                        else:
-                            cplus_q  = (up_q > up_s + EPS_COMPARE)
-                            cplus_sw = (up_s > up_q + EPS_COMPARE)
-                            cminus_q  = (um_q > um_s + EPS_COMPARE)
-                            cminus_sw = (um_s > um_q + EPS_COMPARE)
-                            if (cplus_q and cminus_sw) or (cplus_sw and cminus_q):
-                                C.add((u, v))
+                        up_s = U_pp + theta_plus_vals[iu] * (betas_u - beta_q_vals[iu]) + theta_plus_vals[iv] * (
+                                    betas_v - beta_q_vals[iv])
+                        um_q = U_pp + (aj - theta_plus_vals[iu]) * beta_q_vals[iu] + (ai - theta_plus_vals[iv]) * \
+                               beta_q_vals[iv]
+                        um_s = up_s + (aj - theta_plus_vals[iu]) * betas_u + (ai - theta_plus_vals[iv]) * betas_v
+                        if not ((U_pp > up_s + EPS_COMPARE and um_q > um_s + EPS_COMPARE) or (
+                                up_s > U_pp + EPS_COMPARE and um_s > um_q + EPS_COMPARE)):
+                            C.add((u, v))
         return C
 
-    # Generic fallback
-    C: Set[Tuple[Any, Any]] = set()
-
-    def _decide(a: float, b: float) -> Optional[str]:
-        if a > b + EPS_COMPARE: return "q"
-        if b > a + EPS_COMPARE: return "swap"
-        return None
-
+    # Generic Fallback (Supports Quadratic)
+    C = set()
     theta_plus = compute_expected_posteriors(q_groups, domain, prior)
-    beta_q     = system_best_response(q_groups, domain, prior, biases, receiver_model, gamma=gamma)
-    order_q    = flatten_in_order(q_groups)
+    beta_q = system_best_response(q_groups, domain, prior, biases, receiver_model, gamma)
 
-    for (u, v) in op_pairs_strict(q_groups):
-        q_swap    = swap_single_pair(q_groups, u, v)
-        theta_min = compute_expected_posteriors(q_swap, domain, prior)
-        beta_s    = system_best_response(q_swap, domain, prior, biases, receiver_model, gamma=gamma)
-        order_s   = flatten_in_order(q_swap)
-
-        up_q = user_utility_from_response(theta_plus, beta_q, receiver_model, order_list=order_q, eps_order=eps_order)
-        up_s = user_utility_from_response(theta_plus, beta_s, receiver_model, order_list=order_s, eps_order=eps_order)
-        um_q = user_utility_from_response(theta_min,  beta_q, receiver_model, order_list=order_q, eps_order=eps_order)
-        um_s = user_utility_from_response(theta_min,  beta_s, receiver_model, order_list=order_s, eps_order=eps_order)
-
-        if rule == "paper":
-            both_q    = (up_q > up_s + EPS_COMPARE) and (um_q > um_s + EPS_COMPARE)
-            both_swap = (up_s > up_q + EPS_COMPARE) and (um_s > um_q + EPS_COMPARE)
-            if not (both_q or both_swap):
-                C.add((u, v))
-        else:
-            cplus  = _decide(up_q, up_s)
-            cminus = _decide(um_q, um_s)
-            if tie_policy == "force_on_ties":
-                if cplus is None:  cplus  = "q"
-                if cminus is None: cminus = "swap"
-            if cplus is not None and cminus is not None and cplus != cminus:
-                C.add((u, v))
+    for i in range(len(q_groups)):
+        for j in range(i + 1, len(q_groups)):
+            for u in q_groups[i]:
+                for v in q_groups[j]:
+                    q_swap = [[(v if x == u else (u if x == v else x)) for x in g] for g in q_groups]
+                    theta_min = compute_expected_posteriors(q_swap, domain, prior)
+                    beta_s = system_best_response(q_swap, domain, prior, biases, receiver_model, gamma)
+                    up_q = user_utility_from_response(theta_plus, beta_q, receiver_model)
+                    up_s = user_utility_from_response(theta_plus, beta_s, receiver_model)
+                    um_q = user_utility_from_response(theta_min, beta_q, receiver_model)
+                    um_s = user_utility_from_response(theta_min, beta_s, receiver_model)
+                    if not ((up_q > up_s + EPS_COMPARE and um_q > um_s + EPS_COMPARE) or (
+                            up_s > up_q + EPS_COMPARE and um_s > um_q + EPS_COMPARE)):
+                        C.add((u, v))
     return C
 
-def _reachability_bitsets(items: List[Any], edges: Set[Tuple[Any, Any]]):
-    n = len(items)
+
+def _reachability_bitsets(items, edges):
+    n = len(items);
     idx = {v: i for i, v in enumerate(items)}
-    neigh = [[] for _ in range(n)]
+    adj = [[] for _ in range(n)]
     for u, v in edges:
         iu, iv = idx.get(u), idx.get(v)
-        if iu is not None and iv is not None and iu < iv:
-            neigh[iu].append(iv)
+        if iu is not None and iv is not None and iu < iv: adj[iu].append(iv)
     R = [0] * n
     for i in range(n - 1, -1, -1):
-        mask = 0
-        for j in neigh[i]:
-            mask |= (1 << j) | R[j]
-        R[i] = mask
+        m = 0
+        for j in adj[i]: m |= (1 << j) | R[j]
+        R[i] = m
     return idx, R
 
-def _boundary_supported(idx_map, R, Gi: List[Any], Gj: List[Any],
-                        *, policy: str = "all", alpha: float = 0.5) -> bool:
-    """
-    policy:
-      - "all":      every (u,v) with u∈Gi, v∈Gj is reachable (original)
-      - "any":      at least one (u,v) is reachable
-      - "quantile": at least alpha fraction of pairs are reachable (0<alpha<=1)
-    """
-    if not Gi or not Gj:
-        return True
 
-    want_mask = 0
-    for v in Gj:
-        want_mask |= (1 << idx_map[v])
-
-    if policy == "all":
-        for u in Gi:
-            if (R[idx_map[u]] & want_mask) != want_mask:
-                return False
-        return True
-
-    total = len(Gi) * len(Gj)
-    supported = 0
-    for u in Gi:
-        mask_u = R[idx_map[u]]
-        if policy == "any":
-            if mask_u & want_mask:
-                return True
-        else:  # "quantile"
-            for v in Gj:
-                if (mask_u >> idx_map[v]) & 1:
-                    supported += 1
-
-    if policy == "any":
-        return False
-    need = math.ceil(alpha * total)
-    return supported >= need
-
-def algorithm_2_build_qbase(
-    initial_order: List[Any], domain: List[Any], prior: PriorSpec, *,
-    biases: Dict[Any, float], receiver_model: str = "threshold", gamma: float = 1.0,
-    eps_order: float = 0.0, rule: str = "paper",
-    boundary_policy: str = "all", alpha: float = 0.5,
-) -> List[List[Any]]:
-    q_cur: List[List[Any]] = [[x] for x in initial_order]
+def algorithm_2_build_qbase(initial_order, domain, prior, *, biases, receiver_model="threshold", gamma=1.0,
+                            rule="paper"):
+    q_cur = [[x] for x in initial_order]
     for _ in range(len(domain) + 1):
-        C = algorithm_1_credibility_detection(
-            q_cur, domain, prior, biases=biases,
-            receiver_model=receiver_model, gamma=gamma, eps_order=0.0, rule=rule
-        )
+        C = algorithm_1_credibility_detection(q_cur, domain, prior, biases=biases, receiver_model=receiver_model,
+                                              gamma=gamma, rule=rule)
         idx_map, R = _reachability_bitsets([x for g in q_cur for x in g], C)
-
         merged = False
-        i = 0
-        while i < len(q_cur) - 1:
+        for i in range(len(q_cur) - 1):
             Gi, Gj = q_cur[i], q_cur[i + 1]
-            if not _boundary_supported(idx_map, R, Gi, Gj, policy=boundary_policy, alpha=alpha):
-                q_cur = q_cur[:i] + [Gi + Gj] + q_cur[i + 2:]
-                merged = True
+            want_mask = sum(1 << idx_map[v] for v in Gj)
+            if not all((R[idx_map[u]] & want_mask) == want_mask for u in Gi):
+                q_cur = q_cur[:i] + [Gi + Gj] + q_cur[i + 2:];
+                merged = True;
                 break
-            i += 1
-        if not merged:
-            break
+        if not merged: break
     return q_cur
 
-def algorithm_2_build_qbase_from_groups(
-    q_init_groups: List[List[Any]], domain: List[Any], prior: PriorSpec, *,
-    biases: Dict[Any, float], receiver_model: str = "threshold", gamma: float = 1.0,
-    eps_order: float = 0.0, rule: str = "paper",
-    boundary_policy: str = "all", alpha: float = 0.5,
-) -> List[List[Any]]:
-    _validate_partition_or_die(q_init_groups, domain)
-    q_cur = [g[:] for g in q_init_groups]
-    for _ in range(max(0, len(q_cur) - 1) + 1):
-        C = algorithm_1_credibility_detection(
-            q_cur, domain, prior, biases=biases,
-            receiver_model=receiver_model, gamma=gamma, eps_order=0.0, rule=rule
-        )
-        idx_map, R = _reachability_bitsets([x for g in q_cur for x in g], C)
 
-        merged = False
-        i = 0
-        while i < len(q_cur) - 1:
-            Gi, Gj = q_cur[i], q_cur[i + 1]
-            if not _boundary_supported(idx_map, R, Gi, Gj, policy=boundary_policy, alpha=alpha):
-                q_cur = q_cur[:i] + [Gi + Gj] + q_cur[i + 2:]
-                merged = True
-                break
-            i += 1
-        if not merged:
-            break
-    return q_cur
-
-def algorithm_4_maximally_informative(
-    q_base: List[List[Any]],
-    domain: List[Any],
-    prior: PriorSpec,
-    *,
-    biases: Dict[Any, float],
-    receiver_model: str = "threshold",
-    gamma: float = 1.0,
-    eps_order_for_tiebreak: float = 0.0
-) -> List[List[Any]]:
+def algorithm_4_maximally_informative(q_base, domain, prior, *, biases, receiver_model="threshold", gamma=1.0):
     m = len(q_base)
-    if m == 0:
-        return []
-
+    if m == 0: return []
     theta = compute_expected_posteriors([[v] for v in domain], domain, prior)
-
-    beta_base = system_best_response(q_base, domain, prior, biases, receiver_model, gamma=gamma)
-    base_gain0: List[float] = []
-    base_gain_eps: List[float] = []
-    for t in range(m):
-        items_t = q_base[t]
-        resp_t = {x: beta_base.get(x, 0 if receiver_model == "threshold" else 0.0) for x in items_t}
-        u0   = user_utility_from_response(theta, resp_t, receiver_model, order_list=None,    eps_order=0.0)
-        ueps = user_utility_from_response(theta, resp_t, receiver_model, order_list=items_t, eps_order=eps_order_for_tiebreak)
-        base_gain0.append(u0)
-        base_gain_eps.append(ueps)
-
-    C0 = [[0.0] * m for _ in range(m)]
-    Ceps = [[0.0] * m for _ in range(m)]
-    for i in range(m):
-        for j in range(i, m):
-            run_items = [x for g in q_base[i:j+1] for x in g]
-            temp_q = q_base[:i] + [run_items] + q_base[j+1:]
-            beta_run = system_best_response(temp_q, domain, prior, biases, receiver_model, gamma=gamma)
-            resp_run = {x: beta_run.get(x, 0 if receiver_model == "threshold" else 0.0) for x in run_items}
-
-            u0_run   = user_utility_from_response(theta, resp_run, receiver_model, order_list=None,     eps_order=0.0)
-            ueps_run = user_utility_from_response(theta, resp_run, receiver_model, order_list=run_items, eps_order=eps_order_for_tiebreak)
-
-            base_line0  = sum(base_gain0[t]   for t in range(i, j+1))
-            base_lineep = sum(base_gain_eps[t] for t in range(i, j+1))
-            C0[i][j]   = u0_run   - base_line0
-            Ceps[i][j] = ueps_run - base_lineep
-
-    if max(C0[i][j] for i in range(m) for j in range(i, m)) <= EPS_COMPARE:
-        return q_base
-
-    dp   = [0.0] * (m + 1)
-    tie  = [0.0] * (m + 1)
-    prev = [-1]  * (m + 1)
-
+    dp = [0.0] * (m + 1);
+    prev = [-1] * (m + 1)
     for t in range(1, m + 1):
-        best_val, best_tie, arg = -float("inf"), -float("inf"), -1
+        best_val, arg = -float("inf"), -1
         for i in range(1, t + 1):
-            g0   = C0[i-1][t-1]
-            geps = Ceps[i-1][t-1]
-            val  = dp[i-1] + (g0   if g0   > EPS_COMPARE else 0.0)
-            tiev = tie[i-1] + (geps if g0   > EPS_COMPARE else 0.0)
-            better = (val > best_val + EPS_COMPARE) or \
-                     (abs(val - best_val) <= EPS_COMPARE and (tiev > best_tie + EPS_COMPARE)) or \
-                     (abs(val - best_val) <= EPS_COMPARE and abs(tiev - best_tie) <= EPS_COMPARE and (i - 1) > arg)
-            if better:
-                best_val, best_tie, arg = val, tiev, i - 1
-        dp[t], tie[t], prev[t] = best_val, best_tie, arg
-
-    q_star: List[List[Any]] = []
+            run = [x for g in q_base[i - 1:t] for x in g]
+            resp = system_best_response([run], domain, prior, biases, receiver_model, gamma)
+            # Local utility for the items in the run
+            u = user_utility_from_response({x: theta[x] for x in run}, resp, receiver_model)
+            val = dp[i - 1] + u
+            if val > best_val + EPS_COMPARE: best_val, arg = val, i - 1
+        dp[t], prev[t] = best_val, arg
+    q_star = [];
     t = m
     while t > 0:
-        i = prev[t]
-        q_star.insert(0, [x for g in q_base[i:t] for x in g])
+        i = prev[t];
+        q_star.insert(0, [x for g in q_base[i:t] for x in g]);
         t = i
     return q_star
 
-# =============================================================================
-# Utilities for reporting and evaluation
-# =============================================================================
-
-def evaluate_plan_utility(
-    q_groups: List[List[Any]],
-    domain: List[Any],
-    prior: PriorSpec,
-    *,
-    biases: Dict[Any, float],
-    receiver_model: str = "threshold",
-    gamma: float = 1.0,
-) -> Tuple[float, Optional[int]]:
-    theta = compute_expected_posteriors([[v] for v in domain], domain, prior)
-    beta = system_best_response(q_groups, domain, prior, biases,
-                                receiver_model=receiver_model, gamma=gamma)
-    util = user_utility_from_response(theta, beta, receiver_model, order_list=None, eps_order=0.0)
-    kept = None
-    if receiver_model == "threshold":
-        kept = sum(int(beta.get(v, 0)) for v in (x for g in q_groups for x in g))
-    return float(util), kept
 
 # =============================================================================
-# Experiment helpers (Cartesian domain over attributes)
+# Scalability experiment
 # =============================================================================
 
-def _distinct_values_sorted(df: pd.DataFrame, col: str):
-    xs = pd.unique(df[col])
-    try:
-        return sorted(xs.tolist())
-    except Exception:
-        return sorted(map(str, xs.tolist()))
-
-def build_cartesian_domain(df: pd.DataFrame, cols: List[str]) -> List[Any]:
-    """
-    Domain = Cartesian product of DISTINCT values across given columns.
-    Items are tuples; final order is DESC lexicographic (to define ranks).
-    """
-    domains = [_distinct_values_sorted(df, c) for c in cols]
-    prod = itertools.product(*domains)
-    dom = [tuple(t) for t in prod]
+def build_cartesian_domain(df, cols):
+    domains = [sorted(pd.unique(df[c]).tolist()) for c in cols]
+    dom = [tuple(t) for t in itertools.product(*domains)]
     dom.sort(reverse=True)
     return dom
 
-def pick_columns_smallest_domains(df: pd.DataFrame, candidates: List[str], k: int) -> List[str]:
+
+def pick_columns_smallest_domains(df, candidates, k):
     stats = sorted([(c, int(df[c].nunique())) for c in candidates], key=lambda t: (t[1], t[0]))
     return [c for c, _ in stats[:k]]
 
-# =============================================================================
-# Scalability experiment: time vs #attributes (stores rich metrics)
-# =============================================================================
+
+def evaluate_plan_utility(q_groups, domain, prior, *, biases, receiver_model="threshold", gamma=1.0):
+    theta = compute_expected_posteriors([[v] for v in domain], domain, prior)
+    beta = system_best_response(q_groups, domain, prior, biases, receiver_model, gamma)
+    util = user_utility_from_response(theta, beta, receiver_model)
+    kept = sum(int(beta.get(v, 0)) for v in (x for g in q_groups for x in g)) if receiver_model == "threshold" else None
+    return float(util), kept
+
 
 def run_scalability_time_vs_num_attrs_logging(
-    df: pd.DataFrame,
-    candidate_cols: List[str],
-    *,
-    max_k: Optional[int] = None,
-    total_timeout_s: float = 600.0,       # 10 minutes
-    csv_path: str = "../results/tables/time_vs_num_attrs.csv",
-    plot_path: str = "../results/plots/time_vs_num_attrs.png",
-    append: bool = False,                 # overwrite by default
-    rule: str = "paper",
-    boundary_policy: str = "all",
-    alpha: float = 0.5,
-    bias_levels: Tuple[float, ...] = (0.6, 0.5, 0.2, 0.2),
-    bias_probs:  Tuple[float, ...] = (0.25, 0.25, 0.25, 0.25),
-    bias_seed: int = 123,
-    print_progress: bool = True,
+        df, candidate_cols, *, max_k=None, total_timeout_s=600.0,
+        csv_path="../results/tables/time_vs_num_attrs.csv",
+        plot_path="../results/plots/time_vs_num_attrs.png",
+        append=False, receiver_model="threshold", bias_seed=123, print_progress=True
 ):
-    """
-    For k = 1..max_k:
-      - choose k columns (smallest domain sizes first),
-      - build full Cartesian domain over those columns (tuples),
-      - bias = random multilevel over the Cartesian domain,
-      - measure & log:
-          time_alg1_first_s, num_edges_alg1 (=|C| for first-pass singletons),
-          time_alg2_s, time_alg4_s, time_alg24_s (=2+4),
-          q_base_groups, q_star_groups, merges_alg2,
-          utilities & kept for q_babble/q_base/q_star.
-      - write a row to CSV after each k
-      - plot (#attrs vs time_alg24_s)
-    """
     os.makedirs(os.path.dirname(csv_path), exist_ok=True)
     os.makedirs(os.path.dirname(plot_path), exist_ok=True)
 
-    header = [
-        "timestamp", "k_attrs", "cols_json", "domain_size",
-        "time_alg1_first_s", "num_edges_alg1",
-        "time_alg2_s", "time_alg4_s", "time_alg24_s",
-        "q_base_groups", "q_star_groups", "merges_alg2",
-        "utility_q_babble", "utility_q_base", "utility_q_star",
-        "kept_q_babble", "kept_q_base", "kept_q_star",
-    ]
-
-    want_header = True
-    if append and os.path.exists(csv_path):
-        want_header = False
-    if (not append) and os.path.exists(csv_path):
-        os.remove(csv_path)
-
-    import csv as _csv
-    f = open(csv_path, "a", newline="")
-    w = _csv.writer(f, quoting=_csv.QUOTE_NONNUMERIC, escapechar="\\")
-    if want_header:
-        w.writerow(header); f.flush()
+    header = ["timestamp", "k_attrs", "domain_size", "time_alg1_first_s", "num_edges_alg1", "time_alg24_s",
+              "utility_q_star"]
+    if not append or not os.path.exists(csv_path):
+        with open(csv_path, "w") as f: f.write(",".join(header) + "\n")
 
     start_all = time.perf_counter()
     prior = PriorSpec(kind="uniform")
-
     ordered_cols = pick_columns_smallest_domains(df, candidate_cols, len(candidate_cols))
-    if max_k is None:
-        max_k = len(ordered_cols)
+    max_k = max_k or len(ordered_cols)
 
-    xs, ys_alg24, ys_alg1 = [], [], []
+    xs, ys_alg24 = [], []
     for k in range(1, max_k + 1):
         cols_k = ordered_cols[:k]
         dom = build_cartesian_domain(df, cols_k)
-        print(f"[k={k}] cols={cols_k} => |domain|={len(dom):,}")
         ksize = len(dom)
-        if ksize == 0:
-            if print_progress:
-                print(f"[k={k}] EMPTY domain for cols={cols_k}; skipping.")
-            continue
+        biases = biases_from_bias_obj(dom, make_random_L_level_bias(dom, L=ksize, seed=bias_seed))
 
-        # L can be len(dom) for near-unique, or something small like 4/6/8 for more ties.
-        L =len(dom)
-        bias_obj = make_random_L_level_bias(dom, L=L, seed=bias_seed)
-        biases = biases_from_bias_obj(dom, bias_obj)
-
-        # --- Alg.1 first pass (on singleton query) ---
-        q_singletons = [[v] for v in dom]
+        # Alg 1 first pass
         t1a = time.perf_counter()
-        C0 = algorithm_1_credibility_detection(
-            q_singletons, dom, prior,
-            biases=biases, receiver_model="threshold",
-            gamma=1.0, eps_order=0.0,
-            tie_policy="neutral", rule=rule
-        )
-        t1b = time.perf_counter()
-        time_alg1_first = t1b - t1a
-        num_edges_alg1 = len(C0)
+        C0 = algorithm_1_credibility_detection([[v] for v in dom], dom, prior, biases=biases,
+                                               receiver_model=receiver_model)
+        time_alg1 = time.perf_counter() - t1a
 
-        # --- Alg.2 total time ---
-        t2a = time.perf_counter()
-        q_base = algorithm_2_build_qbase(
-            dom, dom, prior,
-            biases=biases, receiver_model="threshold", gamma=1.0, eps_order=0.0,
-            rule=rule, boundary_policy=boundary_policy, alpha=alpha
-        )
-        t2b = time.perf_counter()
-        time_alg2 = t2b - t2a
+        # Alg 2 + 4
+        t_start = time.perf_counter()
+        q_base = algorithm_2_build_qbase(dom, dom, prior, biases=biases, receiver_model=receiver_model)
+        q_star = algorithm_4_maximally_informative(q_base, dom, prior, biases=biases, receiver_model=receiver_model)
+        time_alg24 = time.perf_counter() - t_start
 
-        q_base_groups = len(q_base)
-        merges_alg2 = len(dom) - q_base_groups
-
-        # --- Alg.4 ---
-        t4a = time.perf_counter()
-        q_star = algorithm_4_maximally_informative(
-            q_base, dom, prior,
-            biases=biases, receiver_model="threshold", gamma=1.0,
-            eps_order_for_tiebreak=0.0
-        )
-        t4b = time.perf_counter()
-        time_alg4 = t4b - t4a
-
-        time_alg24 = time_alg2 + time_alg4  # for plotting
-
-        util_babble, kept_babble = evaluate_plan_utility([dom[:]], dom, prior, biases=biases, receiver_model="threshold", gamma=1.0)
-        util_base,   kept_base   = evaluate_plan_utility(q_base,    dom, prior, biases=biases, receiver_model="threshold", gamma=1.0)
-        util_star,   kept_star   = evaluate_plan_utility(q_star,    dom, prior, biases=biases, receiver_model="threshold", gamma=1.0)
-
-        row = [
-            time.strftime("%Y-%m-%d %H:%M:%S"),
-            k,
-            json.dumps(cols_k),
-            ksize,
-            time_alg1_first,
-            num_edges_alg1,
-            time_alg2,
-            time_alg4,
-            time_alg24,
-            q_base_groups,
-            len(q_star),
-            merges_alg2,
-            util_babble,
-            util_base,
-            util_star,
-            kept_babble,
-            kept_base,
-            kept_star,
-        ]
-        w.writerow(row); f.flush()
+        u_star, _ = evaluate_plan_utility(q_star, dom, prior, biases=biases, receiver_model=receiver_model)
+        u_babble, _ = evaluate_plan_utility([dom[:]], dom, prior, biases=biases, receiver_model=receiver_model)
+        u_base, _ = evaluate_plan_utility(q_base, dom, prior, biases=biases, receiver_model=receiver_model)
 
         if print_progress:
-            print(f"[k={k}] cols={cols_k} | |domain|={ksize:,} | "
-                  f"Alg1_first={time_alg1_first:.3f}s (|C|={num_edges_alg1:,}) | "
-                  f"Alg2={time_alg2:.3f}s | Alg4={time_alg4:.3f}s | 2+4={time_alg24:.3f}s | "
-                  f"q_base={q_base_groups}→q*={len(q_star)} | "
-                  f"U(babble)={util_babble:.4g}, U(base)={util_base:.4g}, U(q★)={util_star:.4g}")
+            print(f"[k={k}] cols={cols_k} => |domain|={ksize:,}")
+            print(
+                f"[k={k}] | Alg1_first={time_alg1:.3f}s (|C|={len(C0)}) | 2+4={time_alg24:.3f}s | q_base={len(q_base)}→q*={len(q_star)} | U(babble)={u_babble:.3f}, U(base)={u_base:.3f}, U(q★)={u_star:.3f}")
 
-        xs.append(k); ys_alg24.append(time_alg24); ys_alg1.append(time_alg1_first)
+        with open(csv_path, "a") as f:
+            f.write(f"{time.ctime()},{k},{ksize},{time_alg1:.4f},{len(C0)},{time_alg24:.4f},{u_star:.4f}\n")
 
-        if (time.perf_counter() - start_all) > total_timeout_s:
-            if print_progress:
-                print(f"⏱️  Stopping at k={k} due to total timeout ({total_timeout_s}s).")
-            break
+        xs.append(k);
+        ys_alg24.append(time_alg24)
+        if (time.perf_counter() - start_all) > total_timeout_s: break
 
-    f.close()
-
-    # Plot (combined time only)
     if xs:
-        plt.figure(figsize=(5.2, 3.0))
-        #make millisecond
-        ys_alg1=[ y*1000 for y in ys_alg1]
-        ys_alg24=[ y*1000 for y in ys_alg24]
-
-        plt.plot(xs, ys_alg1, marker="x", linestyle="-", label="Credibility Detection")
-        plt.plot(xs, ys_alg24, marker="o", linestyle="-", label="Maximally Informative")
-        plt.xlabel("Number of attributes")
-        plt.ylabel("Execution time (ms)")
-        plt.legend()
-        plt.tight_layout()
-        plt.savefig(plot_path, dpi=160)
+        plt.figure(figsize=(5, 3))
+        plt.plot(xs, [y * 1000 for y in ys_alg24], marker="o", label="MI Time")
+        plt.xlabel("Attrs");
+        plt.ylabel("Time (ms)");
+        plt.legend();
+        plt.savefig(plot_path);
         plt.close()
 
-# =============================================================================
-# Example CLI
-# =============================================================================
-def load_compas_df():
-    candidate = "../data/real/compas_bucketized.csv"
-    if os.path.exists(candidate):
-        try:
-            df = pd.read_csv(candidate)
-            return df, True
-        except Exception:
-            pass
-    #Synthetic fallback
-    rng = np.random.default_rng(123)
-    n = 5000
-    df = pd.DataFrame({
-        "age": rng.integers(18, 80, size=n),
-        "education_num": rng.integers(1, 17, size=n),
-        "sex": rng.choice(["Male", "Female"], size=n, p=[0.51, 0.49])
-    })
-    return df, False
 
-def encode_attributes(df: pd.DataFrame,candidate_cols: List[str]) -> pd.DataFrame:
-    df = df.copy()
-    for c in candidate_cols:
-        if df[c].dtype == object or df[c].dtype.name == "category":
-            df[c] = df[c].astype("category").cat.codes
-    return df
+def load_compas_df():
+    path = "../data/real/compas_bucketized.csv"
+    if os.path.exists(path): return pd.read_csv(path), True
+    n = 1000;
+    rng = np.random.default_rng(123)
+    return pd.DataFrame({"age_cat": rng.integers(0, 3, n), "priors_count": rng.integers(0, 10, n),
+                         "v_decile_score": rng.integers(0, 10, n)}), False
+
 
 if __name__ == "__main__":
-    # Minimal demo with a synthetic dataset.
-    # Replace with your real dataframe if desired.
-    dataset="compas"
-    df, found = load_compas_df()
-
-    # Attribute sets
-    candidate_cols= ["age_cat", "priors_count", "v_decile_score" ]
-
-    run_scalability_time_vs_num_attrs_logging(
-        df,
-        candidate_cols=candidate_cols,
-        max_k=len(candidate_cols),
-        total_timeout_s=10800,  # 10 minutes budget
-        csv_path=f'../results/tables/{dataset}_3_time_vs_num_attrs.csv',
-        plot_path=f'../results/plots/{dataset}_3_time_vs_num_attrs.png',
-        append=False,
-        rule="paper",
-        boundary_policy="all",
-        alpha=0.5,
-        bias_levels=(0.6, 0.5, 0.2, 0.2),
-        bias_probs=(0.25, 0.25, 0.25, 0.25),
-        bias_seed=123,
-        print_progress=True,
-    )
-
-    print(f"Done. CSV -> ../results/tables/{dataset}_3_time_vs_num_attrs.csv")
-    print(f"Plot -> ../results/plots/{dataset}_3_time_vs_num_attrs.png")
+    df, _ = load_compas_df()
+    # Support both models
+    for model in ["threshold", "quadratic"]:
+        print(f"\n--- Running Scalability for {model.upper()} receiver ---")
+        run_scalability_time_vs_num_attrs_logging(
+            df, ["age_cat", "priors_count", "v_decile_score"],
+            receiver_model=model,
+            csv_path=f"../results/tables/compas_{model}_3_time_vs_num_attrs.csv",
+            plot_path=f"../results/plots/compas_{model}_3_time_vs_num_attrs.png"
+        )
