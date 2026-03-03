@@ -1,7 +1,7 @@
-# binned_coi.py
+# coi-binned.py
 # -*- coding: utf-8 -*-
 """
-Conservative COI with time-bounded bin refinement (uniform prior + threshold).
+Conservative COI with time-bounded bin refinement (uniform prior + threshold OR quadratic (receiver bias)).
 
 What this does
 --------------
@@ -98,6 +98,59 @@ def evaluate_plan_utility(
     util  = sum(theta.get(v,0.0) * float(beta.get(v,0)) * int(counts.get(v,1)) for v in domain)
     kept  = sum(int(beta.get(v,0)) * int(counts.get(v,1)) for v in domain)
     return float(util), kept
+
+# ---------------------- Quadratic mode (receiver bias) ----------
+def system_best_response_quadratic(
+    q_groups: List[List[Any]],
+    domain: List[Any],
+    prior: PriorSpec,
+    biases: Dict[Any,float]
+) -> Dict[Any,float]:
+    """Quadratic receiver with *receiver bias*.
+
+    Receiver utility: u_R(θ,a) = -(a - (θ + b(v)))^2  where b(v) is the receiver bias for item v.
+    Best response:    a(v | group g) = E[θ | g] + b(v).
+
+    Returns an action map a[v] for all v in q_groups.
+    """
+    post = compute_expected_posteriors(q_groups, domain, prior)  # E[θ | group]
+    a: Dict[Any, float] = {}
+    for g in q_groups:
+        if not g:
+            continue
+        p_g = float(post.get(g[0], 0.0))
+        for v in g:
+            a[v] = p_g + float(biases.get(v, 0.0))
+    for v in domain:
+        a.setdefault(v, 0.0)
+    return a
+
+
+def evaluate_plan_utility_quadratic(
+    q_groups: List[List[Any]],
+    domain: List[Any],
+    prior: PriorSpec,
+    biases: Dict[Any,float],
+    *,
+    counts: Optional[Dict[Any,int]] = None
+) -> Tuple[float,int]:
+    """Sender utility under quadratic loss (what you said you care about).
+
+    Sender utility: u_S(θ,a) = -(a - θ)^2  (weighted by multiplicities if counts provided)
+
+    NOTE: In quadratic mode the 'kept' metric is not meaningful; we return kept=0 to preserve CSV schema.
+    """
+    if counts is None:
+        counts = {v: 1 for v in domain}
+    theta = compute_expected_posteriors([[v] for v in domain], domain, prior)  # per-item E[θ] by rank
+    a = system_best_response_quadratic(q_groups, domain, prior, biases)
+
+    util = 0.0
+    for v in domain:
+        w = int(counts.get(v, 1))
+        diff = float(a.get(v, 0.0) - theta.get(v, 0.0))
+        util += -(diff * diff) * w
+    return float(util), 0
 
 # ---------------------- FULL Alg.1 (optional baseline) -----
 def algorithm_1_credibility_detection_fast_uniform_threshold(
@@ -255,6 +308,78 @@ def algorithm_4_maximally_informative(
         t = i
     return q_star
 
+
+def algorithm_4_maximally_informative_quadratic(
+    q_base: List[List[Any]],
+    domain: List[Any],
+    prior: PriorSpec,
+    *,
+    biases: Dict[Any,float],
+    counts: Optional[Dict[Any,int]] = None
+) -> List[List[Any]]:
+    """Alg.4 DP for quadratic sender utility (receiver-biased quadratic best response).
+
+    Structure matches the threshold DP: compute gains for merging any contiguous run of groups,
+    then pick a disjoint set of merges to maximize total sender utility.
+    """
+    if counts is None:
+        counts = {v: 1 for v in domain}
+    m = len(q_base)
+    if m == 0:
+        return []
+    theta = compute_expected_posteriors([[v] for v in domain], domain, prior)
+
+    a_base = system_best_response_quadratic(q_base, domain, prior, biases)
+
+    base_gain: List[float] = []
+    for t in range(m):
+        items_t = q_base[t]
+        u0 = 0.0
+        for v in items_t:
+            w = int(counts.get(v, 1))
+            diff = float(a_base.get(v, 0.0) - theta.get(v, 0.0))
+            u0 += -(diff * diff) * w
+        base_gain.append(u0)
+
+    # Gain matrix for merging run i..j
+    C0 = [[0.0]*m for _ in range(m)]
+    for i in range(m):
+        for j in range(i, m):
+            run_items = [x for g in q_base[i:j+1] for x in g]
+            temp_q = q_base[:i] + [run_items] + q_base[j+1:]
+            a_run = system_best_response_quadratic(temp_q, domain, prior, biases)
+
+            u_run = 0.0
+            for v in run_items:
+                w = int(counts.get(v, 1))
+                diff = float(a_run.get(v, 0.0) - theta.get(v, 0.0))
+                u_run += -(diff * diff) * w
+
+            base_line = sum(base_gain[t] for t in range(i, j+1))
+            C0[i][j] = u_run - base_line
+
+    if max(C0[i][j] for i in range(m) for j in range(i, m)) <= EPS_COMPARE:
+        return q_base
+
+    dp = [0.0]*(m+1)
+    prev = [-1]*(m+1)
+    for t in range(1, m+1):
+        best, arg = -1e18, -1
+        for i in range(1, t+1):
+            g0 = C0[i-1][t-1]
+            val = dp[i-1] + (g0 if g0 > EPS_COMPARE else 0.0)
+            if (val > best + EPS_COMPARE) or (abs(val - best) <= EPS_COMPARE and (i-1) > arg):
+                best, arg = val, i-1
+        dp[t], prev[t] = best, arg
+
+    q_star: List[List[Any]] = []
+    t = m
+    while t > 0:
+        i = prev[t]
+        q_star.insert(0, [x for g in q_base[i:t] for x in g])
+        t = i
+    return q_star
+
 # ---------------------- Conservative bins (sound) -----
 def _bin_boundary_supported_envelope(Gi: List[Any], Gj: List[Any], *, idx: Dict[Any,int], k: int, prior: PriorSpec, biases: Dict[Any,float]) -> bool:
     """
@@ -280,12 +405,74 @@ def _bin_boundary_supported_envelope(Gi: List[Any], Gj: List[Any], *, idx: Dict[
     usafe = (bi_min >= theta_j_high + EPS_COMPARE) and (bi_max < theta_i_low - EPS_COMPARE)
     return vsafe or usafe
 
+
+def _bin_boundary_supported_envelope_quadratic(
+    Gi: List[Any],
+    Gj: List[Any],
+    *,
+    idx: Dict[Any,int],
+    k: int,
+    prior: PriorSpec,
+    biases: Dict[Any,float]
+) -> bool:
+    """Conservative adjacent-boundary support test for quadratic sender utility with receiver bias.
+
+    Setup (quadratic receiver bias):
+      a(v|g) = E[θ|g] + b(v)
+    Sender utility:
+      u_S = -(a - θ)^2
+
+    For a boundary between adjacent groups Gi (higher) and Gj (lower) to be stable for *all* items
+    crossing it, it suffices that there exists a cutoff c such that:
+        θ(v) - b(v) >= c  for all v in Gi
+        θ(v) - b(v) <= c  for all v in Gj
+
+    For adjacent groups, the indifferent cutoff is:
+        c = (p_i + p_j)/2
+    where p_i = E[θ|Gi] and p_j = E[θ|Gj].
+
+    We conservatively bound θ-b using (min θ in Gi, max bias in Gi) and
+    (max θ in Gj, min bias in Gj) to avoid false positives.
+    """
+    if not Gi or not Gj:
+        return True
+
+    # Rank interval endpoints (DESC ranks 1..k)
+    i_hi = min(idx[x] for x in Gi) + 1
+    i_lo = max(idx[x] for x in Gi) + 1
+    j_hi = min(idx[x] for x in Gj) + 1
+    j_lo = max(idx[x] for x in Gj) + 1
+
+    theta_i_hi = prior.rank_expectation(k, i_hi)  # highest θ in Gi
+    theta_i_lo = prior.rank_expectation(k, i_lo)  # lowest  θ in Gi
+    theta_j_hi = prior.rank_expectation(k, j_hi)  # highest θ in Gj
+    theta_j_lo = prior.rank_expectation(k, j_lo)  # lowest  θ in Gj (unused)
+
+    # Group mean posteriors under uniform-permutation prior
+    p_i = 0.5 * (theta_i_hi + theta_i_lo)
+    p_j = 0.5 * (theta_j_hi + theta_j_lo)
+
+    if p_i <= p_j + EPS_COMPARE:
+        return False
+
+    c = 0.5 * (p_i + p_j)
+
+    bi_max = max(biases.get(x, 0.0) for x in Gi)
+    bj_min = min(biases.get(x, 0.0) for x in Gj)
+
+    # Conservative bounds on θ - b
+    min_upper = theta_i_lo - bi_max
+    max_lower = theta_j_hi - bj_min
+
+    return (max_lower <= c + EPS_COMPARE) and (c <= min_upper + EPS_COMPARE)
+
 def algorithm_2_build_qbase_conservative_bins(
     q_bins: List[List[Any]],
     domain: List[Any],
     prior: PriorSpec,
     *,
-    biases: Dict[Any,float]
+    biases: Dict[Any,float],
+    boundary_check=_bin_boundary_supported_envelope
 ) -> List[List[Any]]:
     q_cur = [g[:] for g in q_bins]
     idx = {v:i for i,v in enumerate(domain)}
@@ -294,7 +481,7 @@ def algorithm_2_build_qbase_conservative_bins(
         merged = False
         for i in range(len(q_cur)-1):
             Gi, Gj = q_cur[i], q_cur[i+1]
-            supported = _bin_boundary_supported_envelope(Gi, Gj, idx=idx, k=k, prior=prior, biases=biases)
+            supported = boundary_check(Gi, Gj, idx=idx, k=k, prior=prior, biases=biases)
             if not supported:
                 q_cur = q_cur[:i] + [Gi+Gj] + q_cur[i+2:]
                 merged = True
@@ -303,13 +490,13 @@ def algorithm_2_build_qbase_conservative_bins(
             return q_cur
 
 # ---------------------- First CD timer on bins --------
-def time_binlevel_CD(bins: List[List[Any]], domain: List[Any], prior: PriorSpec, biases: Dict[Any,float]) -> float:
+def time_binlevel_CD(bins: List[List[Any]], domain: List[Any], prior: PriorSpec, biases: Dict[Any,float], boundary_check=_bin_boundary_supported_envelope) -> float:
     """Time a single pass of bin-level credibility checks (envelope test) across boundaries."""
     idx = {v:i for i,v in enumerate(domain)}
     k = len(domain)
     t0 = time.perf_counter()
     for i in range(len(bins)-1):
-        _ = _bin_boundary_supported_envelope(bins[i], bins[i+1], idx=idx, k=k, prior=prior, biases=biases)
+        _ = boundary_check(bins[i], bins[i+1], idx=idx, k=k, prior=prior, biases=biases)
     return time.perf_counter() - t0
 
 # ---------------------- Bias generators ---------------
@@ -456,6 +643,7 @@ def run_experiment_with_timeout(
     growth_mode: str = "geometric",
     growth_factor: float = 1.5,
     explicit_bins: Optional[List[int]] = None,
+    utility_mode: str = "threshold",            # "threshold" (original) or "quadratic"
     bias_kind: str = "random_multilevel",
     bias_direction: str = "down",
     low: float = 0.15, high: float = 0.85,
@@ -483,6 +671,18 @@ def run_experiment_with_timeout(
     prior = PriorSpec(kind="uniform")
     if counts is None:
         counts = {v: 1 for v in domain}
+
+    # Utility mode dispatch (keep original behavior by default)
+    if utility_mode == "threshold":
+        eval_fn = evaluate_plan_utility
+        alg4_fn = algorithm_4_maximally_informative
+        boundary_fn = _bin_boundary_supported_envelope
+    elif utility_mode == "quadratic":
+        eval_fn = evaluate_plan_utility_quadratic
+        alg4_fn = algorithm_4_maximally_informative_quadratic
+        boundary_fn = _bin_boundary_supported_envelope_quadratic
+    else:
+        raise ValueError(f"Unknown utility_mode: {utility_mode}")
 
     # CSV header
     os.makedirs(os.path.dirname(csv_path) or ".", exist_ok=True)
@@ -555,7 +755,7 @@ def run_experiment_with_timeout(
 
         # Babble baseline (anchor) — WEIGHTED, logged once per run with run=0 or run_idx?
         # We'll record it per run with bins_count=1 and run=run_idx for clarity.
-        util_bab, kept_bab = evaluate_plan_utility([domain[:]], domain, prior, biases, counts=counts)
+        util_bab, kept_bab = eval_fn([domain[:]], domain, prior, biases, counts=counts)
         elapsed0 = time.perf_counter() - start_all
         w.writerow([run_idx, "babble", n, 1, 0.0, 0.0, 0.0,
                     1, 1,
@@ -564,7 +764,7 @@ def run_experiment_with_timeout(
                     bias_kind, bias_direction, low, high, jitter, local_seed,
                     elapsed0]); f.flush()
         if print_progress:
-            print(f"[run {run_idx} | babble] n={n} | U={util_bab:.4f} | kept={kept_bab}")
+            print(f"[run {run_idx} | babble] n={n} | U={util_bab:.4f} | kept={kept_bab} | utility_mode={utility_mode}")
 
         # === Inner loop over bins in the schedule ===
         for B in schedule:
@@ -577,20 +777,20 @@ def run_experiment_with_timeout(
             bins = build_equal_bins_desc(domain, B)
 
             # --- Alg.1 on bins
-            time_alg1 = time_binlevel_CD(bins, domain, prior, biases)
+            time_alg1 = time_binlevel_CD(bins, domain, prior, biases, boundary_check=boundary_fn)
 
             # --- Alg.2 on bins
             t2a = time.perf_counter()
-            q_base = algorithm_2_build_qbase_conservative_bins(bins, domain, prior, biases=biases)
+            q_base = algorithm_2_build_qbase_conservative_bins(bins, domain, prior, biases=biases, boundary_check=boundary_fn)
             t2b = time.perf_counter()
 
             # --- Alg.4 DP
             t4a = time.perf_counter()
-            q_star = algorithm_4_maximally_informative(q_base, domain, prior, biases=biases, counts=counts)
+            q_star = alg4_fn(q_base, domain, prior, biases=biases, counts=counts)
             t4b = time.perf_counter()
 
-            util_base, kept_base = evaluate_plan_utility(q_base, domain, prior, biases, counts=counts)
-            util_star, kept_star = evaluate_plan_utility(q_star, domain, prior, biases, counts=counts)
+            util_base, kept_base = eval_fn(q_base, domain, prior, biases, counts=counts)
+            util_star, kept_star = eval_fn(q_star, domain, prior, biases, counts=counts)
 
             elapsed = time.perf_counter() - start_all
             w.writerow([run_idx, "binned", n, B, time_alg1, (t2b - t2a), (t4b - t4a),
@@ -602,12 +802,12 @@ def run_experiment_with_timeout(
 
             if print_progress:
                 print(f"[run {run_idx} | bins={B:5d}] q_base={len(q_base):4d}→q*={len(q_star):4d} | "
-                      f"U(babble)={util_bab:.4f}, U(base)={util_base:.4f}, U(q*)={util_star:.4f} | "
+                      f"U(babble)={util_bab:.4f}, U(base)={util_base:.4f}, U(q*)={util_star:.4f}, ΔU={util_star-util_bab:.4f} | "
                       f"kept(babble)={kept_bab}, kept(base)={kept_base}, kept(q*)={kept_star} | "
                       f"t1={time_alg1:.4f}s t2={(t2b-t2a):.4f}s t4={(t4b-t4a):.4f}s | elapsed={elapsed:.1f}s")
 
         # Optional FULL baseline (kept intact; small n only)
-        if with_full and n <= 4:
+        if with_full and utility_mode == "threshold" and n <= 4:
             q_singletons = [[v] for v in domain]
             t1a = time.perf_counter()
             _ = algorithm_1_credibility_detection_fast_uniform_threshold(q_singletons, domain, prior, biases=biases)
@@ -636,12 +836,10 @@ def run_experiment_with_timeout(
                 print(f"[run {run_idx} | full] n={n} | q_base={len(q_base_full)}→q*={len(q_star_full)} | "
                       f"U(babble)={util_bab:.4f}, U(base)={util_base_full:.4f}, U(q*)={util_star_full:.4f} | "
                       f"kept(babble)={kept_bab}, kept(base)={kept_base_full}, kept(q*)={kept_star_full} | "
-                      f"t1={time_alg1_full:.4f}s t2={t2b-t2a:.4f}s t4={t4b-t4a:.4f}s | elapsed={elapsed:.1f}s")
+                      f"t1={time_alg1_full:.4f}s t2={(t2b-t2a):.4f}s t4={(t4b-t4a):.4f}s | elapsed={elapsed:.1f}s")
 
     f.close()
     print("CSV ->", csv_path)
-
-
 
 # ---------------------- CLI ---------------------------
 def parse_int_list(s: str) -> List[int]:
@@ -651,41 +849,48 @@ def parse_int_list(s: str) -> List[int]:
         if tok:
             out.append(int(tok))
     return out
+
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--from_csv", type=str, default="", help="Path to CSV with the numeric column (use --col).")
-    ap.add_argument("--col", type=str, default="price", help="Numeric column to build the distinct domain from.")
-    ap.add_argument("--n", type=int, default=0, help="Domain size if not loading from CSV (DESC integers).")
-    ap.add_argument("--bins", type=str, default="", help="Explicit bin counts (comma-separated). If empty, use growth schedule.")
-    ap.add_argument("--time_budget_s", type=float, default=600.0, help="Global time budget (seconds) per dataset run.")
-    ap.add_argument("--start_bins", type=int, default=2)
-    ap.add_argument("--growth_mode", type=str, default="geometric", choices=["geometric","linear"])
+
+    ap.add_argument("--from_csv", type=str, default="", help="Path to CSV with numeric column (use --col).")
+    ap.add_argument("--col",      type=str, default="price", help="Numeric column for domain.")
+    ap.add_argument("--n",        type=int, default=0, help="Synthetic domain size if not loading from CSV (DESC ints).")
+
+    ap.add_argument("--bins",          type=str, default="", help="Explicit bins list (comma-separated).")
+    ap.add_argument("--time_budget_s", type=float, default=600.0)
+    ap.add_argument("--start_bins",    type=int, default=2)
+    ap.add_argument("--growth_mode",   type=str, default="geometric", choices=["geometric","linear"])
     ap.add_argument("--growth_factor", type=float, default=1.5)
-    ap.add_argument("--with_full", type=int, default=0)
-    ap.add_argument("--append", action="store_true", help="Append to CSV instead of overwriting.")
 
-    # Bias controls
+    ap.add_argument("--utility", type=str, default="threshold", choices=["threshold","quadratic"],
+                    help="Utility mode: threshold (original) or quadratic (sender quadratic loss + receiver bias).")
+
     ap.add_argument("--bias_kind", type=str, default="random_multilevel",
-                    choices=["sigmoid","quantile_steps","power","hockey","random_multilevel"])
+                    choices=["random_multilevel","sigmoid","quantile_steps","power","hockey"])
     ap.add_argument("--bias_dir",  type=str, default="down", choices=["down","up"])
-    ap.add_argument("--low",   type=float, default=0.15)
-    ap.add_argument("--high",  type=float, default=0.85)
-    ap.add_argument("--center",type=float, default=0.65)
-    ap.add_argument("--ksig",  type=float, default=10.0)
-    ap.add_argument("--steps", type=int,   default=12)
-    ap.add_argument("--alpha", type=float, default=1.4)
-    ap.add_argument("--tau",   type=float, default=0.7)
-    ap.add_argument("--jitter",type=float, default=0.00)
-    ap.add_argument("--seed",  type=int,   default=123)
 
-    # Optional random_multilevel knobs (kept for compatibility)
+    ap.add_argument("--low",    type=float, default=0.15)
+    ap.add_argument("--high",   type=float, default=0.85)
+    ap.add_argument("--center", type=float, default=0.65)
+    ap.add_argument("--ksig",   type=float, default=10.0)
+    ap.add_argument("--steps",  type=int,   default=12)
+    ap.add_argument("--alpha",  type=float, default=1.4)
+    ap.add_argument("--tau",    type=float, default=0.7)
+    ap.add_argument("--jitter", type=float, default=0.0)
+    ap.add_argument("--seed",   type=int,   default=123)
+
+    ap.add_argument("--append",    action="store_true")
+    ap.add_argument("--with_full", type=int, default=0, help="1 to run full baseline (n<=4 only).")
+
+    # random_multilevel optional knobs
     ap.add_argument("--levels", type=str, default="",
-                    help="For random_multilevel: int (L) or comma-separated float levels. Empty = default.")
-    ap.add_argument("--probs", type=str, default="",
-                    help="For random_multilevel: comma-separated probabilities matching levels. Empty = uniform for int levels, or default for tuple levels.")
+                    help="For random_multilevel: either an int (e.g., 8) or comma list (e.g., 0.9,0.7,0.5).")
+    ap.add_argument("--probs",  type=str, default="",
+                    help="For random_multilevel: comma list of probabilities; leave empty or set to None for uniform.")
 
     # Multi-run controls
-    ap.add_argument("--runs", type=int, default=5, help="Number of runs per bins_count.")
+    ap.add_argument("--runs", type=int, default=5)
     ap.add_argument("--resample_bias_each_run", type=int, default=1,
                     help="1 to resample biases with seed+run each run; 0 to keep same biases across runs.")
 
@@ -724,6 +929,7 @@ def main():
         growth_mode=args.growth_mode,
         growth_factor=args.growth_factor,
         explicit_bins=explicit_bins,
+        utility_mode=args.utility,
         bias_kind=args.bias_kind,
         bias_direction=args.bias_dir,
         low=args.low, high=args.high,
