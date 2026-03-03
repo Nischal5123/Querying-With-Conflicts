@@ -27,7 +27,7 @@ return relevant information over large data.
 This framework implements three algorithms from your research paper:
 
 1. **Algorithm 1**: Detecting Trustworthy Answers 
-2. **Algorithm 2**: Detecting Influential Queries Base Query 
+2. **Algorithm 2-3**: Detecting Influential Queries
 3. **Algorithm 4**: Maximally Informative Query (q★) 
 
 ## 🚀 Quick Start
